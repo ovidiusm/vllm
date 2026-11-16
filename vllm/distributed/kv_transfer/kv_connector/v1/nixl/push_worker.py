@@ -17,10 +17,12 @@ matched pushes whose P→D handshake has finished so the writer can
 (re-)issue the WRITE without ever blocking on the network.
 
 Wake model: the writer self-polls every
-`_PUSH_WRITER_POLL_INTERVAL_MS` only while it has unmatched
-`_push_finished_blocks` (i.e. P-side blocks waiting for a D PUSH_REG
-notif that has no other wake source). All other progress is
-event-driven: the engine main thread sets `_push_writer_wake` from
+`_PUSH_WRITER_POLL_INTERVAL_MS` while it has unmatched
+`_push_finished_blocks` (P-side blocks waiting for a D PUSH_REG notif),
+in-flight WRITEs (`_poll_sending_transfers`, polled so NIXL sends D the
+completion notif without waiting for the next engine step), or D-side
+receives awaiting that notif. All other
+progress is event-driven: the engine main thread sets `_push_writer_wake` from
 `start_load_kv` (when handing it new work) and from `get_finished`
 (so each engine step gives the writer a chance to drain NIXL notifs);
 the handshake-completion callback sets the same event after a deferred
@@ -31,6 +33,7 @@ the writer drops any leftover `_push_finished_blocks` /
 `_pending_d_registrations` and stops self-polling.
 """
 
+import contextlib
 import queue
 import threading
 import time
@@ -233,6 +236,8 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 len(meta.remote.block_ids),
             )
             self._recving_metadata[req_id] = meta
+        if metadata.reqs_to_recv:
+            self._push_writer_wake.set()
 
         # --- D-side: registrations to send to P via NIXL ---
         if metadata.push_registrations:
@@ -323,14 +328,29 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             except Exception:
                 logger.exception("nixl-push-writer error; continuing")
 
-            # Self-poll only while there is no other wake source: P-side
-            # finished blocks waiting for a D PUSH_REG match. All other
-            # progress is event-driven (see module docstring).
-            if self._push_finished_blocks:
+            has_sending = self._poll_sending_transfers()
+
+            if self._push_finished_blocks or has_sending or self._recving_metadata:
                 self._push_writer_stop.wait(timeout=sleep_s)
             else:
                 self._push_writer_wake.wait()
                 self._push_writer_wake.clear()
+
+    def _poll_sending_transfers(self) -> bool:
+        """Advance in-flight WRITE handles so NIXL emits completion notifs to D.
+
+        NIXL caches terminal transfer status in the handle, so main-thread
+        `get_transfer_results` still reaps handles, records stats, and updates
+        leases unchanged.
+        """
+        has_in_progress = False
+        with self._sending_transfers_lock:
+            for handles in self._sending_transfers.values():
+                for handle in handles:
+                    with contextlib.suppress(Exception):
+                        if self.nixl_wrapper.check_xfer_state(handle) == "PROC":
+                            has_in_progress = True
+        return has_in_progress
 
     def _handle_push_reg_notif(self, notif: bytes) -> None:
         try:

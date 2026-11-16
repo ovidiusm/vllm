@@ -2150,3 +2150,45 @@ def test_push_handshake_rejects_different_block_sizes(
 
     with pytest.raises(NotImplementedError, match="identical P/D block sizes"):
         worker._validate_remote_parallel_config(metadata)
+
+
+def test_writer_polls_sending_and_recving_without_main_thread_step():
+    """`nixl-push-writer` polls outbound WRITE handles and inbound completion
+    notifs while active, while `get_transfer_results` still reaps on the main
+    thread.
+    """
+    w = TestPushWriterNotifs._pollable_worker()
+    req_id = "req-bg-poll"
+    w._sending_transfers[req_id] = [501]
+    w._reqs_to_send[req_id] = time.perf_counter() + 60.0
+    w._reqs_to_process.add(req_id)
+
+    seen_done = threading.Event()
+    calls = 0
+
+    def _check_state(_h: int) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "PROC"
+        seen_done.set()
+        return "DONE"
+
+    w.nixl_wrapper.check_xfer_state.side_effect = _check_state
+    w.nixl_wrapper.get_new_notifs.return_value = {}
+    w._push_writer_wake.set()
+
+    t = threading.Thread(target=w._push_writer_loop, daemon=True)
+    w._push_writer_thread = t
+    t.start()
+    try:
+        assert seen_done.wait(timeout=2.0), "writer did not poll WRITE to DONE"
+        w.nixl_wrapper.release_xfer_handle.assert_not_called()
+        results = w.get_transfer_results()
+        assert results.finished_sending == {req_id}
+        w.nixl_wrapper.release_xfer_handle.assert_called_once_with(501)
+    finally:
+        w._push_writer_stop.set()
+        w._push_writer_wake.set()
+        t.join(timeout=2)
+        w._push_writer_thread = None
